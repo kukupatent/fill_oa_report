@@ -431,6 +431,15 @@ REASON_GROUPS = [
 
 DEFAULT_FEASIBILITY = "다소 높음\n(60-65%)"
 
+# 극복가능성 레이블 → (셀 텍스트, 배경색 hex)
+FEASIBILITY_OPTIONS = {
+    "매우 높음": ("매우 높음\n(80%)",    "5AFFAF"),
+    "다소 높음": ("다소 높음\n(60-65%)", "91FFCA"),
+    "중간":      ("중간\n(55-60%)",      "FFD899"),
+}
+# 기본값 레이블
+DEFAULT_FEASIBILITY_LABEL = "다소 높음"
+
 
 def _get_cell(row, col_idx):
     """고유셀 기준 col_idx번째 셀 반환."""
@@ -572,45 +581,39 @@ def _set_response_cell(cell, text: str, justify: bool = False, indent_twips: int
 def fill_response_table(doc, found_reasons: set, override_feasibility: dict = None):
     """
     대응방안 요약 표(표3)를 파싱된 거절이유로 채웁니다.
+    override_feasibility: {거절이유 레이블: "매우 높음" | "다소 높음" | "중간"}
     """
     import copy
     from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn as _qn
 
     tbl = doc.tables[3]
 
-    # 실제 적용할 거절이유 행 목록 계산
+    # 거절이유별 행 목록 계산
     remaining = set(found_reasons)
     rows_to_fill = []
 
     for reason_set, label in REASON_GROUPS:
         if reason_set <= remaining:
-            feasibility = DEFAULT_FEASIBILITY
-            if override_feasibility:
-                feasibility = override_feasibility.get(label, DEFAULT_FEASIBILITY)
-            rows_to_fill.append((label, feasibility))
+            f_label = (override_feasibility or {}).get(label, DEFAULT_FEASIBILITY_LABEL)
+            rows_to_fill.append((label, f_label))
             remaining -= reason_set
 
     for reason in sorted(remaining):
-        feasibility = DEFAULT_FEASIBILITY
-        if override_feasibility:
-            feasibility = override_feasibility.get(reason, DEFAULT_FEASIBILITY)
-        rows_to_fill.append((reason, feasibility))
+        f_label = (override_feasibility or {}).get(reason, DEFAULT_FEASIBILITY_LABEL)
+        rows_to_fill.append((reason, f_label))
 
     if not rows_to_fill:
         return
 
-    # 데이터 행(행1~) 삭제 전에 행1 XML을 템플릿으로 복사
     template_tr = copy.deepcopy(tbl.rows[1]._tr)
 
     for row in tbl.rows[1:]:
         tbl._tbl.remove(row._tr)
 
-    # 거절이유별로 새 행 생성
-    for label, feasibility in rows_to_fill:
+    for label, f_label in rows_to_fill:
         new_tr = copy.deepcopy(template_tr)
         tbl._tbl.append(new_tr)
-
-        # 방금 추가된 마지막 행
         new_row = tbl.rows[-1]
 
         # 열0: 거절이유
@@ -623,10 +626,25 @@ def fill_response_table(doc, found_reasons: set, override_feasibility: dict = No
         if c1:
             _set_response_cell(c1, "")
 
-        # 열2: 극복가능성
+        # 열2: 극복가능성 (텍스트 + 배경색)
         c2 = _get_cell(new_row, 2)
         if c2:
-            _set_response_cell(c2, feasibility)
+            text, bg_color = FEASIBILITY_OPTIONS.get(
+                f_label, FEASIBILITY_OPTIONS[DEFAULT_FEASIBILITY_LABEL]
+            )
+            _set_response_cell(c2, text)
+            # 배경색 적용
+            tcPr = c2._tc.find(_qn('w:tcPr'))
+            if tcPr is None:
+                tcPr = OxmlElement('w:tcPr')
+                c2._tc.insert(0, tcPr)
+            shd = tcPr.find(_qn('w:shd'))
+            if shd is None:
+                shd = OxmlElement('w:shd')
+                tcPr.append(shd)
+            shd.set(_qn('w:val'),   'clear')
+            shd.set(_qn('w:color'), 'auto')
+            shd.set(_qn('w:fill'),  bg_color)
 
 
 # ── 3-b. OA 내용 분석 표 ─────────────────────
@@ -836,20 +854,31 @@ def fill_amendment_table(doc, claim1_with_header: str, all_claims_text: str):
 
 def fill_inventor_review_para(doc, info: dict):
     """
-    '5. 발명자 검토 요청 사항' 단락을 아래 형식으로 채웁니다:
-    상기 건의 의견서 제출기일은 {의견서 마감일}이므로, {발명자 검토회신 요청일}까지 검토의견을 부탁드립니다.
+    '5. 발명자 검토 요청 사항' 단락의 날짜를 파싱된 값으로 교체합니다.
 
-    서식:
-      - 기본 텍스트: SpoqaHanSans-Light, 10pt (sz=20), 검정
-      - 의견서 마감일: 볼드 + 빨강(FF0000)
-      - 발명자 검토회신 요청일: 볼드 + 파랑(0070C0)
+    원본 구조:
+      run0  : "위의 내용을 검토하시어...바랍니다. "  (고정 텍스트)
+      run1~9 : "상기 건의...년 " + 의견서 마감일(볼드+빨강) + "이므로 늦어도 "
+      run11~21: 발명자 검토회신 요청일(볼드+파랑) + "까지..."
+      run22~23: "위 내용에..." + "감사합니다. " (고정)
+
+    → 날짜 부분 run을 각각 1개씩 새 run으로 교체
     """
     from docx.oxml.ns import qn as _qn
+    import copy
 
-    deadline      = info.get("의견서 마감일", "")
-    review_date   = info.get("발명자 검토회신 요청일", "")
+    deadline    = info.get("의견서 마감일", "")       # "2026.01.23."
+    review_date = info.get("발명자 검토회신 요청일", "")  # "2025.11.23."
 
-    # 기존 단락에서 해당 텍스트가 포함된 단락 탐색
+    def _fmt_korean(d: str) -> str:
+        """2026.01.23. → 2026년 1월 23일"""
+        m = re.match(r'(\d{4})\.(\d{1,2})\.(\d{1,2})\.?', d.strip())
+        return f"{m.group(1)}년 {int(m.group(2))}월 {int(m.group(3))}일" if m else d
+
+    deadline_kr    = _fmt_korean(deadline)
+    review_date_kr = _fmt_korean(review_date)
+
+    # 대상 단락 탐색
     target_para = None
     for para in doc.paragraphs:
         if "의견서 제출기일" in para.text or "검토의견을 부탁드립니다" in para.text:
@@ -858,56 +887,95 @@ def fill_inventor_review_para(doc, info: dict):
     if target_para is None:
         return
 
-    # 기존 run 모두 제거
-    for run in list(target_para.runs):
-        run._r.getparent().remove(run._r)
+    runs = target_para.runs
 
-    def _make_run(text: str, bold: bool = False, color: str = None) -> OxmlElement:
-        r_el = OxmlElement('w:r')
-        rPr  = OxmlElement('w:rPr')
-        # 폰트
-        rFonts = OxmlElement('w:rFonts')
-        rFonts.set(_qn('w:ascii'),    FONT_NAME)
-        rFonts.set(_qn('w:eastAsia'), FONT_NAME)
-        rFonts.set(_qn('w:hAnsi'),    FONT_NAME)
-        rPr.append(rFonts)
-        # 크기 (10pt = sz 20)
-        sz = OxmlElement('w:sz')
-        sz.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
-        szCs = OxmlElement('w:szCs')
-        szCs.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
-        rPr.append(sz); rPr.append(szCs)
-        # 볼드
-        if bold:
-            b = OxmlElement('w:b')
-            rPr.append(b)
-        # 색상
-        if color:
-            c_el = OxmlElement('w:color')
-            c_el.set(_qn('w:val'), color)
-            rPr.append(c_el)
-        r_el.append(rPr)
-        t_el = OxmlElement('w:t')
+    def _make_run(template_run, text: str) -> OxmlElement:
+        """template_run의 서식을 복사해 text만 교체한 새 w:r 반환."""
+        new_r = copy.deepcopy(template_run._r)
+        t_el = new_r.find(_qn('w:t'))
+        if t_el is None:
+            t_el = OxmlElement('w:t')
+            new_r.append(t_el)
         t_el.text = text
         t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        r_el.append(t_el)
-        return r_el
+        return new_r
 
-    # 단락 구성: 앞 텍스트 + 마감일(볼드+빨강) + 중간 + 요청일(볼드+파랑) + 뒷 텍스트
-    segments = [
-        ("상기 건의 의견서 제출기일은 ", False, None),
-        (deadline,                       True,  "FF0000"),
-        ("이므로, ",                      False, None),
-        (review_date,                    True,  "0070C0"),
-        ("까지 검토의견을 부탁드립니다.", False, None),
-    ]
-    for text, bold, color in segments:
-        if text:
-            target_para._p.append(_make_run(text, bold=bold, color=color))
+    # ── 의견서 마감일 교체: run1~9를 run1 서식으로 2개(년 부분 + 볼드 날짜)로 교체
+    # run1: "상기 건의 의견서 제출기일은 YYYY년 " (일반)
+    # run6~9: "M월 DD일" (볼드+빨강)
+    # 전략: run1에 "상기 건의 의견서 제출기일은 " 쓰고,
+    #        run1 뒤에 년 run, 볼드 run 순으로 삽입 후 run2~9 삭제
+
+    if len(runs) >= 10:
+        # 년도 부분 파싱
+        year_deadline    = deadline_kr.split("년")[0] + "년 "   # "2026년 "
+        month_day_dl     = deadline_kr.split("년 ")[1]           # "1월 23일"
+
+        # run1 → "상기 건의 의견서 제출기일은 YYYY년 "
+        runs[1]._r.find(_qn('w:t')).text = "상기 건의 의견서 제출기일은 " + year_deadline
+
+        # run6(볼드+빨강 서식) → "M월 DD일"
+        runs[6]._r.find(_qn('w:t')).text = month_day_dl
+
+        # run2~5, run7~9 삭제 (합쳐진 내용이 run1, run6에)
+        for run in list(runs[2:6]) + list(runs[7:10]):
+            run._r.getparent().remove(run._r)
+
+        # run 목록 갱신 후 마감일 뒤 텍스트 run 확인
+        runs = target_para.runs
+
+    # ── 검토회신 요청일 교체: "이므로 늦어도 YYYY년 " + 볼드 "MM월 DD일"
+    # 현재 runs에서 "이므로" run, 년도 run, 볼드 run 찾기
+    if len(runs) >= 8:
+        year_review   = review_date_kr.split("년")[0] + "년 "   # "2025년 "
+        month_day_rv  = review_date_kr.split("년 ")[1]           # "11월 23일"
+
+        # "이므로 늦어도 " run 탐색
+        for i, run in enumerate(runs):
+            if "이므로" in run.text:
+                # 다음에 년도 run들 + 볼드 run이 있음
+                # 이 run에 "이므로 늦어도 YYYY년 " 씀
+                runs[i]._r.find(_qn('w:t')).text = "이므로 늦어도 " + year_review
+                # i+1부터 볼드 run 찾기
+                bold_start = None
+                for j in range(i+1, len(runs)):
+                    rPr = runs[j]._r.find(_qn('w:rPr'))
+                    b   = rPr.find(_qn('w:b')) if rPr is not None else None
+                    if b is not None:
+                        bold_start = j
+                        break
+                if bold_start is not None:
+                    # 중간 일반 run들(년도 조각들) 삭제
+                    for run in list(runs[i+1:bold_start]):
+                        run._r.getparent().remove(run._r)
+                    runs = target_para.runs
+                    # bold_start 재탐색
+                    for j, run in enumerate(runs):
+                        rPr = run._r.find(_qn('w:rPr'))
+                        b   = rPr.find(_qn('w:b')) if rPr is not None else None
+                        clr = rPr.find(_qn('w:color')) if rPr is not None else None
+                        clr_val = clr.get(_qn('w:val')) if clr is not None else None
+                        if b is not None and clr_val == "0070C0":
+                            # 이 run → "MM월 DD일"
+                            runs[j]._r.find(_qn('w:t')).text = month_day_rv
+                            # 뒤따르는 같은 색 볼드 run들 삭제
+                            k = j + 1
+                            while k < len(runs):
+                                rPr2 = runs[k]._r.find(_qn('w:rPr'))
+                                b2   = rPr2.find(_qn('w:b')) if rPr2 is not None else None
+                                clr2 = rPr2.find(_qn('w:color')) if rPr2 is not None else None
+                                cv2  = clr2.get(_qn('w:val')) if clr2 is not None else None
+                                if b2 is not None and cv2 == "0070C0":
+                                    runs[k]._r.getparent().remove(runs[k]._r)
+                                    runs = target_para.runs
+                                else:
+                                    break
+                            break
+                break
 
 
 def fill_docx(template_path: str, info: dict, output_path: str,
-              app_pdf_path: str = ""):
+              app_pdf_path: str = "", override_feasibility: dict = None):
     shutil.copy(template_path, output_path)
     doc = Document(output_path)
 
@@ -997,7 +1065,7 @@ def fill_docx(template_path: str, info: dict, output_path: str,
                 set_cell_text(cell, fill_map.get(field_key, ""))
 
     # ── 대응방안 요약 표 채우기 (표3, 0-indexed)
-    fill_response_table(doc, info.get("거절이유_set", set()), override_feasibility=None)
+    fill_response_table(doc, info.get("거절이유_set", set()), override_feasibility=override_feasibility)
 
     # ── OA 내용 분석 표 채우기 (표4, 0-indexed)
     fill_oa_analysis_table(doc, info)
