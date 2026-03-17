@@ -614,37 +614,47 @@ def fill_response_table(doc, found_reasons: set, override_feasibility: dict = No
     for label, f_label in rows_to_fill:
         new_tr = copy.deepcopy(template_tr)
         tbl._tbl.append(new_tr)
-        new_row = tbl.rows[-1]
+
+        # _tr에서 직접 고유 셀(<w:tc>) 추출 (python-docx 캐시 우회)
+        tc_list = new_tr.findall(_qn('w:tc'))
+        if len(tc_list) < 3:
+            continue
+
+        from docx.table import _Cell
+        from docx.oxml.ns import qn as _qn2
+
+        def _tc_to_cell(tc):
+            return _Cell(tc, tbl)
+
+        c0 = _tc_to_cell(tc_list[0])
+        c1 = _tc_to_cell(tc_list[1])
+        c2 = _tc_to_cell(tc_list[2])
 
         # 열0: 거절이유
-        c0 = _get_cell(new_row, 0)
-        if c0:
-            _set_response_cell(c0, label)
+        _set_response_cell(c0, label)
 
         # 열1: 대응방안 요약 (빈칸)
-        c1 = _get_cell(new_row, 1)
-        if c1:
-            _set_response_cell(c1, "")
+        _set_response_cell(c1, "")
 
         # 열2: 극복가능성 (텍스트 + 배경색)
-        c2 = _get_cell(new_row, 2)
-        if c2:
-            text, bg_color = FEASIBILITY_OPTIONS.get(
-                f_label, FEASIBILITY_OPTIONS[DEFAULT_FEASIBILITY_LABEL]
-            )
-            _set_response_cell(c2, text)
-            # 배경색 적용
-            tcPr = c2._tc.find(_qn('w:tcPr'))
-            if tcPr is None:
-                tcPr = OxmlElement('w:tcPr')
-                c2._tc.insert(0, tcPr)
-            shd = tcPr.find(_qn('w:shd'))
-            if shd is None:
-                shd = OxmlElement('w:shd')
-                tcPr.append(shd)
-            shd.set(_qn('w:val'),   'clear')
-            shd.set(_qn('w:color'), 'auto')
-            shd.set(_qn('w:fill'),  bg_color)
+        text, bg_color = FEASIBILITY_OPTIONS.get(
+            f_label, FEASIBILITY_OPTIONS[DEFAULT_FEASIBILITY_LABEL]
+        )
+        _set_response_cell(c2, text)
+
+        # 배경색 직접 tc_list[2]에 적용
+        tc2 = tc_list[2]
+        tcPr = tc2.find(_qn('w:tcPr'))
+        if tcPr is None:
+            tcPr = OxmlElement('w:tcPr')
+            tc2.insert(0, tcPr)
+        shd = tcPr.find(_qn('w:shd'))
+        if shd is None:
+            shd = OxmlElement('w:shd')
+            tcPr.append(shd)
+        shd.set(_qn('w:val'),   'clear')
+        shd.set(_qn('w:color'), 'auto')
+        shd.set(_qn('w:fill'),  bg_color)
 
 
 # ── 3-b. OA 내용 분석 표 ─────────────────────
