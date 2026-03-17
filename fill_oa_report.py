@@ -143,7 +143,11 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
     info["발명자"] = ", ".join(names)
 
     # 발명의 명칭
-    raw = find(r"발\s*명\s*의\s*명\s*칭\s+(.+?)(?:\n발송번호|\n출원번호|\n1\.|$)", re.DOTALL)
+    # 1순위: 같은 줄에서만 캡처 (거절결정서·의견제출통지서 등 한 줄 레이아웃)
+    raw = find(r"발\s*명\s*의\s*명\s*칭\s+(.+?)(?:\n|$)")
+    # 2순위: DOTALL로 여러 줄 캡처 (명칭이 여러 줄에 걸치는 경우), 단 과다 캡처 방지를 위해 종결자 명시
+    if not raw:
+        raw = find(r"발\s*명\s*의\s*명\s*칭\s+(.+?)(?:\n발송번호|\n출원번호|\n1\.|$)", re.DOTALL)
     info["발명의 명칭"] = " ".join(raw.split())
 
     # 통지서 발행일 (발송일자)
