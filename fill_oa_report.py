@@ -834,6 +834,78 @@ def fill_amendment_table(doc, claim1_with_header: str, all_claims_text: str):
 
 
 
+def fill_inventor_review_para(doc, info: dict):
+    """
+    '5. 발명자 검토 요청 사항' 단락을 아래 형식으로 채웁니다:
+    상기 건의 의견서 제출기일은 {의견서 마감일}이므로, {발명자 검토회신 요청일}까지 검토의견을 부탁드립니다.
+
+    서식:
+      - 기본 텍스트: SpoqaHanSans-Light, 10pt (sz=20), 검정
+      - 의견서 마감일: 볼드 + 빨강(FF0000)
+      - 발명자 검토회신 요청일: 볼드 + 파랑(0070C0)
+    """
+    from docx.oxml.ns import qn as _qn
+
+    deadline      = info.get("의견서 마감일", "")
+    review_date   = info.get("발명자 검토회신 요청일", "")
+
+    # 기존 단락에서 해당 텍스트가 포함된 단락 탐색
+    target_para = None
+    for para in doc.paragraphs:
+        if "의견서 제출기일" in para.text or "검토의견을 부탁드립니다" in para.text:
+            target_para = para
+            break
+    if target_para is None:
+        return
+
+    # 기존 run 모두 제거
+    for run in list(target_para.runs):
+        run._r.getparent().remove(run._r)
+
+    def _make_run(text: str, bold: bool = False, color: str = None) -> OxmlElement:
+        r_el = OxmlElement('w:r')
+        rPr  = OxmlElement('w:rPr')
+        # 폰트
+        rFonts = OxmlElement('w:rFonts')
+        rFonts.set(_qn('w:ascii'),    FONT_NAME)
+        rFonts.set(_qn('w:eastAsia'), FONT_NAME)
+        rFonts.set(_qn('w:hAnsi'),    FONT_NAME)
+        rPr.append(rFonts)
+        # 크기 (10pt = sz 20)
+        sz = OxmlElement('w:sz')
+        sz.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
+        szCs = OxmlElement('w:szCs')
+        szCs.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
+        rPr.append(sz); rPr.append(szCs)
+        # 볼드
+        if bold:
+            b = OxmlElement('w:b')
+            rPr.append(b)
+        # 색상
+        if color:
+            c_el = OxmlElement('w:color')
+            c_el.set(_qn('w:val'), color)
+            rPr.append(c_el)
+        r_el.append(rPr)
+        t_el = OxmlElement('w:t')
+        t_el.text = text
+        t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        r_el.append(t_el)
+        return r_el
+
+    # 단락 구성: 앞 텍스트 + 마감일(볼드+빨강) + 중간 + 요청일(볼드+파랑) + 뒷 텍스트
+    segments = [
+        ("상기 건의 의견서 제출기일은 ", False, None),
+        (deadline,                       True,  "FF0000"),
+        ("이므로, ",                      False, None),
+        (review_date,                    True,  "0070C0"),
+        ("까지 검토의견을 부탁드립니다.", False, None),
+    ]
+    for text, bold, color in segments:
+        if text:
+            target_para._p.append(_make_run(text, bold=bold, color=color))
+
+
 def fill_docx(template_path: str, info: dict, output_path: str,
               app_pdf_path: str = ""):
     shutil.copy(template_path, output_path)
@@ -935,6 +1007,9 @@ def fill_docx(template_path: str, info: dict, output_path: str,
         claim1_text, claim1_with_header, all_claims_text = parse_claims_from_application(app_pdf_path)
         fill_current_claim_table(doc, claim1_with_header)
         fill_amendment_table(doc, claim1_with_header, all_claims_text)
+
+    # ── 5. 발명자 검토 요청 사항 단락 채우기
+    fill_inventor_review_para(doc, info)
 
     doc.save(output_path)
 
