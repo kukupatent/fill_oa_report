@@ -153,9 +153,25 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
     # 통지서 발행일 (발송일자)
     info["통지서 발행일"] = find(r"발송일자[:\s]+(\d{4}\.\d{2}\.\d{2}\.?)").rstrip(".")
 
-    # 의견서 마감일 (제출기일)
-    raw = find(r"제출기일[:\s]+(\d{4}\.\d{2}\.\d{2}\.?)")
-    info["의견서 마감일"] = raw.rstrip(".") + "." if raw else ""
+    # ── OA 종류: 문서 제목으로 판별 (날짜 계산보다 먼저)
+    if re.search(r"거\s*절\s*결\s*정\s*서", full_text):
+        info["OA 종류"] = "거절결정"
+    else:
+        info["OA 종류"] = "1차 OA"
+
+    # 의견서 마감일
+    # - 1차 OA: 제출기일 직접 파싱
+    # - 거절결정: 발송일자 + 3개월
+    if info["OA 종류"] == "거절결정":
+        try:
+            parts = info["통지서 발행일"].split(".")
+            y, mo, d = int(parts[0]), int(parts[1]), int(parts[2])
+            info["의견서 마감일"] = add_months(date(y, mo, d), 3).strftime("%Y.%m.%d.")
+        except Exception:
+            info["의견서 마감일"] = ""
+    else:
+        raw = find(r"제출기일[:\s]+(\d{4}\.\d{2}\.\d{2}\.?)")
+        info["의견서 마감일"] = raw.rstrip(".") + "." if raw else ""
 
     # ── 당소관리번호: PDF 파일명의 [파이특허][관리번호] 패턴에서 추출
     # 예: _파이특허__DPA250072IPB_의견제출통지서.pdf
@@ -168,19 +184,13 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
         m = re.search(r'([DIO]P[AMEC]\d+[A-Z]*)', filename, re.IGNORECASE)
     info["당소관리번호"] = m.group(1).upper() if m else ""
 
-    # ── 발명자 검토회신 요청일: 통지서 발행일 + 2개월
+    # ── 발명자 검토회신 요청일: 통지서 발행일 + 2개월 (OA 종류 무관)
     try:
         parts = info["통지서 발행일"].split(".")
         y, mo, d = int(parts[0]), int(parts[1]), int(parts[2])
         info["발명자 검토회신 요청일"] = add_months(date(y, mo, d), 2).strftime("%Y.%m.%d.")
     except Exception:
         info["발명자 검토회신 요청일"] = ""
-
-    # ── OA 종류: 문서 제목으로 판별
-    if re.search(r"거\s*절\s*결\s*정\s*서", full_text):
-        info["OA 종류"] = "거절결정"
-    else:
-        info["OA 종류"] = "1차 OA"
 
     # ── 거절이유: 거절이유 표에서 직접 추출 (가장 정확)
     found_set, claim_map = parse_rejection_from_table(pdf_path)
@@ -920,7 +930,7 @@ def fill_inventor_review_para(doc, info: dict):
     # 전략: run1에 "상기 건의 의견서 제출기일은 " 쓰고,
     #        run1 뒤에 년 run, 볼드 run 순으로 삽입 후 run2~9 삭제
 
-    if len(runs) >= 10:
+    if len(runs) >= 10 and "년" in deadline_kr and "월" in deadline_kr:
         # 년도 부분 파싱
         year_deadline    = deadline_kr.split("년")[0] + "년 "   # "2026년 "
         month_day_dl     = deadline_kr.split("년 ")[1]           # "1월 23일"
@@ -940,7 +950,7 @@ def fill_inventor_review_para(doc, info: dict):
 
     # ── 검토회신 요청일 교체: "이므로 늦어도 YYYY년 " + 볼드 "MM월 DD일"
     # 현재 runs에서 "이므로" run, 년도 run, 볼드 run 찾기
-    if len(runs) >= 8:
+    if len(runs) >= 8 and "년" in review_date_kr and "월" in review_date_kr:
         year_review   = review_date_kr.split("년")[0] + "년 "   # "2025년 "
         month_day_rv  = review_date_kr.split("년 ")[1]           # "11월 23일"
 
