@@ -3,21 +3,27 @@ fill_oa_report.py
 =================
 의견제출통지서(PDF) + OA 검토보고서 템플릿(DOCX) →
 서지사항 표를 자동으로 채운 DOCX를 출력합니다.
+출력 파일명은 자동 생성됩니다: [파이특허][관리번호] 1차OA 검토보고서.docx
 
 사용법:
-    python fill_oa_report.py <통지서.pdf> <템플릿.docx> [출력.docx]
+    python fill_oa_report.py <의견제출통지서.pdf> [출원서.rtf|.docx] <템플릿.docx>
 
-예시:
-    python fill_oa_report.py 의견제출통지서.pdf 1차_OA_검토보고서.docx 결과.docx
+예시 (의견제출통지서만):
+    python fill_oa_report.py 의견제출통지서.pdf template.docx
+
+예시 (출원서 포함):
+    python fill_oa_report.py 의견제출통지서.pdf 출원서.rtf template.docx
+    python fill_oa_report.py 의견제출통지서.pdf 출원서.docx template.docx
 
 필요 라이브러리:
     pip install python-docx pdfplumber
 """
 
-import sys, re, shutil, calendar
+import sys, re, shutil, calendar, copy
 from pathlib import Path
 from datetime import date
 import pdfplumber
+from docx.oxml import OxmlElement
 from docx import Document
 
 # ── 상수 ─────────────────────────────────────
@@ -70,32 +76,44 @@ def add_months(d: date, months: int) -> date:
     return date(year, month, day)
 
 
-def parse_rejection_from_table(pdf_path: str) -> set:
+def parse_rejection_from_table(pdf_path: str) -> tuple:
     """
-    거절이유 표(1페이지)의 '관련 법조항' 컬럼에서 직접 추출.
-    텍스트 추출보다 훨씬 안정적.
+    거절이유 표의 '관련 법조항' 및 '거절이유가 있는 부분' 컬럼에서 추출.
+    모든 페이지를 순서대로 탐색하여 첫 번째 거절이유 표를 사용.
+
+    반환값: (found_set, claim_map)
+      - found_set: {"진보성", "기재불비", ...}
+      - claim_map: {"진보성": "청구항 제1항 내지 제12항, 제20항", "기재불비": "청구항 제13항 내지 제19항", ...}
     """
     found = set()
+    claim_map = {}  # reason → 청구항 텍스트
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            # 1페이지 표에서 거절이유 추출
-            tables = pdf.pages[0].extract_tables()
-            for tbl in tables:
-                if not tbl or len(tbl[0]) < 2:
-                    continue
-                # 헤더 확인: '관련 법조항' 포함 여부
-                header = [str(c or "") for c in tbl[0]]
-                if not any("법조항" in h for h in header):
-                    continue
-                law_col = next(i for i, h in enumerate(header) if "법조항" in h)
-                for row in tbl[1:]:
-                    law_text = str(row[law_col] or "")
-                    for pattern, reason in LAW_TO_REASON.items():
-                        if re.search(pattern, law_text):
-                            found.add(reason)
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for tbl in tables:
+                    if not tbl or len(tbl[0]) < 2:
+                        continue
+                    header = [str(c or "") for c in tbl[0]]
+                    if not any("법조항" in h for h in header):
+                        continue
+                    law_col   = next(i for i, h in enumerate(header) if "법조항" in h)
+                    claim_col = next((i for i, h in enumerate(header) if "있는 부분" in h), None)
+                    for row in tbl[1:]:
+                        law_text   = str(row[law_col] or "")
+                        claim_text = str(row[claim_col] or "").strip() if claim_col is not None else ""
+                        # 줄바꿈 정리
+                        claim_text = " ".join(claim_text.split())
+                        for pattern, reason in LAW_TO_REASON.items():
+                            if re.search(pattern, law_text):
+                                found.add(reason)
+                                if claim_text:
+                                    claim_map[reason] = claim_text
+                    if found:  # 거절이유 표 찾으면 중단
+                        return found, claim_map
     except Exception:
         pass
-    return found
+    return found, claim_map
 
 
 def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
@@ -135,10 +153,15 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
     raw = find(r"제출기일[:\s]+(\d{4}\.\d{2}\.\d{2}\.?)")
     info["의견서 마감일"] = raw.rstrip(".") + "." if raw else ""
 
-    # ── 당소관리번호: PDF 파일명에서 추출
-    # 형식: [DP|OP|IP][A|M|E|C] + 숫자
+    # ── 당소관리번호: PDF 파일명의 [파이특허][관리번호] 패턴에서 추출
+    # 예: _파이특허__DPA250072IPB_의견제출통지서.pdf
+    #     [파이특허][DPA250072IPB] 의견제출통지서.pdf
     filename = Path(pdf_path).stem
-    m = re.search(r'([DIO]P[AMEC]\d+)', filename, re.IGNORECASE)
+    # 우선: [파이특허][XXX] 패턴
+    m = re.search(r'\[파이특허\]\[([^\]]+)\]', filename)
+    if not m:
+        # fallback: 파일명 내 관리번호 패턴 직접 탐색 (DPA250072IPB 등 suffix 포함)
+        m = re.search(r'([DIO]P[AMEC]\d+[A-Z]*)', filename, re.IGNORECASE)
     info["당소관리번호"] = m.group(1).upper() if m else ""
 
     # ── 발명자 검토회신 요청일: 통지서 발행일 + 2개월
@@ -156,7 +179,9 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
         info["OA 종류"] = "1차 OA"
 
     # ── 거절이유: 거절이유 표에서 직접 추출 (가장 정확)
-    info["거절이유_set"] = parse_rejection_from_table(pdf_path)
+    found_set, claim_map = parse_rejection_from_table(pdf_path)
+    info["거절이유_set"] = found_set
+    info["거절이유_청구항"] = claim_map  # {"진보성": "청구항 제1항 내지 ...", ...}
 
     # 표 추출 실패 시 본문 텍스트로 fallback
     if not info["거절이유_set"]:
@@ -167,7 +192,120 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
     return info
 
 
-# ── 2. 셀 조작 헬퍼 ──────────────────────────
+def _parse_rtf_to_text(rtf_path: str) -> str:
+    """RTF 파일을 순수 텍스트로 변환 (한국어 특허 RTF 특화, cp949 인코딩)."""
+    try:
+        data = open(rtf_path, 'rb').read()
+        text = data.decode('cp949')
+    except Exception:
+        return ""
+
+    # 유니코드 이스케이프 \uNNNN 처리
+    text = re.sub(
+        r'\\u(-?\d+)\?',
+        lambda m: chr(int(m.group(1))) if 0 <= int(m.group(1)) <= 0x10FFFF else '',
+        text
+    )
+    # \r\n은 RTF 편집기 줄감기(word wrap) — 가장 먼저 공백 없이 제거
+    text = re.sub(r'\r\n', '', text)
+    # \par → 줄바꿈 (실제 단락 구분)
+    text = re.sub(r'\\par\b', '\n', text)
+    # RTF 서식 명령 제거 (\s? 제거 — catastrophic backtracking 방지)
+    text = re.sub(r'\\[a-zA-Z]+\-?\d*', '', text)
+    # 그룹 괄호 제거
+    text = re.sub(r'[{}]', '', text)
+    # 공백 정규화
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # 청구범위 섹션만 추출한 뒤 줄 이어붙이기 (전체 4MB에 적용하면 느림)
+    m = re.search(r'(【청구범위】.*?)(?:【요약서】|【요약】|$)', text, re.DOTALL)
+    if m:
+        section = m.group(1)
+    else:
+        section = text
+
+    lines = section.split('\n')
+    joined = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            joined.append('')
+            continue
+        if re.match(r'【.*?】', line):
+            joined.append(line)
+            continue
+        if joined and joined[-1] and not re.search(r'[;,.]$', joined[-1]) \
+                and not re.match(r'【.*?】', joined[-1]):
+            # 앞 줄 끝 공백 제거 후 이어붙이기
+            joined[-1] = joined[-1].rstrip() + line
+        else:
+            joined.append(line)
+
+    result = '\n'.join(joined).strip()
+    return result
+
+
+def _parse_docx_to_text(docx_path: str) -> str:
+    """DOCX 출원서에서 텍스트 추출 (단락 단위 줄바꿈)."""
+    try:
+        doc = Document(docx_path)
+        return "\n".join(para.text for para in doc.paragraphs)
+    except Exception:
+        return ""
+
+
+def parse_claims_from_application(app_path: str) -> tuple:
+    """
+    출원서 RTF 또는 DOCX에서 【청구범위】 섹션을 파싱합니다.
+    반환: (claim1_text, claim1_with_header, all_claims_text)
+      - claim1_text        : 청구항 1 본문 (헤더 제외)
+      - claim1_with_header : 【청구항 1】 헤더 + 본문
+      - all_claims_text    : 청구항 1~N 전체 (헤더 포함)
+    """
+    ext = Path(app_path).suffix.lower()
+
+    if ext == '.rtf':
+        full_text = _parse_rtf_to_text(app_path)
+    elif ext == '.docx':
+        full_text = _parse_docx_to_text(app_path)
+    else:
+        return "", "", ""
+
+    if not full_text:
+        return "", "", ""
+
+    m = re.search(r'【청구범위】(.*?)(?:【요약서】|【요약】|$)', full_text, re.DOTALL)
+    if not m:
+        return "", "", ""
+
+    raw = m.group(1).strip()
+
+    # 청구항별 분리
+    parts = re.split(r'(【청구항\s*\d+】)', raw)
+    claims = {}
+    for i in range(1, len(parts), 2):
+        header = parts[i].strip()
+        body   = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        body   = re.sub(r'\n{2,}', '\n', body).strip()
+        num_m  = re.search(r'(\d+)', header)
+        if num_m:
+            claims[int(num_m.group(1))] = (header, body)
+
+    if not claims:
+        return "", "", ""
+
+    claim1_text        = claims[1][1] if 1 in claims else ""
+    claim1_with_header = f"{claims[1][0]}\n{claims[1][1]}" if 1 in claims else ""
+
+    all_parts = []
+    for num in sorted(claims.keys()):
+        header, body = claims[num]
+        all_parts.append(f"{header}\n{body}")
+    all_claims_text = "\n\n".join(all_parts)
+
+    return claim1_text, claim1_with_header, all_claims_text
+
 
 def unique_cell(row, col_index: int):
     """병합 고려: col_index번째 고유 셀 반환"""
@@ -277,9 +415,427 @@ def fill_rejection(cell, found_reasons: set):
             run._r.getparent().remove(run._r)
 
 
+# ── 3. 대응방안 요약 표 ─────────────────────
+
+# 거절이유 표시 순서 및 그룹 정의
+# 신규성+진보성은 함께 파싱되면 하나의 행으로 합침
+REASON_GROUPS = [
+    ({"신규성", "진보성"}, "신규성/진보성"),   # 둘 다 있으면 합침
+    ({"신규성"},           "신규성"),
+    ({"진보성"},           "진보성"),
+    ({"기재불비"},         "기재불비"),
+    ({"신규사항추가"},     "신규사항추가"),
+    ({"미완성 발명"},      "미완성 발명"),
+    ({"기타(비법정 발명)"},"기타(비법정 발명)"),
+]
+
+DEFAULT_FEASIBILITY = "다소 높음\n(60-65%)"
+
+
+def _get_cell(row, col_idx):
+    """고유셀 기준 col_idx번째 셀 반환."""
+    seen, col = set(), 0
+    for cell in row.cells:
+        cid = id(cell._tc)
+        if cid not in seen:
+            seen.add(cid)
+            if col == col_idx:
+                return cell
+            col += 1
+    return None
+
+
+def _set_response_cell(cell, text: str, justify: bool = False, indent_twips: int = 0):
+    """
+    대응방안 표 셀에 텍스트 설정. 기존 run 서식 복제. \n은 줄바꿈으로 처리.
+    justify=True  → 양쪽맞춤 (w:jc both)
+    indent_twips  → 첫줄 들여쓰기. 단, 【청구항 N】 헤더 줄은 들여쓰기 제외.
+                    헤더가 있으면 헤더 단락 + 본문 단락 2개로 분리.
+    """
+    from docx.oxml.ns import qn as _qn
+
+    # 1) 모든 단락에서 run 제거, 첫 단락 서식 템플릿 추출
+    rpr_template = None
+    for p_idx, para in enumerate(cell.paragraphs):
+        for run in para.runs:
+            if p_idx == 0 and rpr_template is None:
+                rpr_el = run._r.find(_qn('w:rPr'))
+                if rpr_el is not None:
+                    rpr_template = copy.deepcopy(rpr_el)
+            run._r.getparent().remove(run._r)
+
+    # 2) 첫 단락 이후 단락 제거
+    for para in cell.paragraphs[1:]:
+        para._p.getparent().remove(para._p)
+
+    # 3) 헤더/본문 분리
+    #    【청구항 N】로 시작하면 첫 줄=헤더, 나머지=본문 (별도 단락)
+    lines = text.split("\n")
+    header_line = None
+    body_lines  = lines
+    if lines and re.match(r'【청구항\s*\d+】', lines[0].strip()):
+        header_line = lines[0]
+        body_lines  = lines[1:]
+
+    def _make_rPr() -> OxmlElement:
+        """run 속성: rpr_template 기반으로 FONT_NAME/SIZE 강제 지정."""
+        rPr = copy.deepcopy(rpr_template) if rpr_template is not None else OxmlElement('w:rPr')
+        # 기존 rFonts 제거 후 새로 지정 (테마 폰트 등 덮어쓰기)
+        for old in rPr.findall(_qn('w:rFonts')):
+            rPr.remove(old)
+        rFonts = OxmlElement('w:rFonts')
+        rFonts.set(_qn('w:ascii'),    FONT_NAME)
+        rFonts.set(_qn('w:eastAsia'), FONT_NAME)
+        rFonts.set(_qn('w:hAnsi'),    FONT_NAME)
+        rPr.insert(0, rFonts)
+        # 크기 지정
+        for old in rPr.findall(_qn('w:sz')):
+            rPr.remove(old)
+        for old in rPr.findall(_qn('w:szCs')):
+            rPr.remove(old)
+        sz = OxmlElement('w:sz')
+        sz.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
+        szCs = OxmlElement('w:szCs')
+        szCs.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
+        rPr.append(sz); rPr.append(szCs)
+        return rPr
+
+    def _write_lines_to_para(para, lns, apply_indent: bool):
+        """단락 pPr 설정 후 lns를 w:br 연결로 씀."""
+        pPr = para._p.find(_qn('w:pPr'))
+        if pPr is None:
+            pPr = OxmlElement('w:pPr')
+            para._p.insert(0, pPr)
+        if justify:
+            jc = pPr.find(_qn('w:jc'))
+            if jc is None:
+                jc = OxmlElement('w:jc')
+                pPr.append(jc)
+            jc.set(_qn('w:val'), 'both')
+        if apply_indent and indent_twips:
+            ind = pPr.find(_qn('w:ind'))
+            if ind is None:
+                ind = OxmlElement('w:ind')
+                pPr.append(ind)
+            ind.set(_qn('w:firstLine'), str(indent_twips))
+
+        for i, line in enumerate(lns):
+            r_el = OxmlElement('w:r')
+            r_el.append(_make_rPr())
+            t_el = OxmlElement('w:t')
+            t_el.text = line
+            t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            r_el.append(t_el)
+            para._p.append(r_el)
+            if i < len(lns) - 1:
+                br_r = OxmlElement('w:r')
+                br_el = OxmlElement('w:br')
+                br_r.append(br_el)
+                para._p.append(br_r)
+
+    first_para = cell.paragraphs[0]
+
+    if header_line is not None:
+        # 헤더 단락: 들여쓰기 없음
+        _write_lines_to_para(first_para, [header_line], apply_indent=False)
+        # 본문: 각 줄을 별도 단락으로 (모두 들여쓰기 적용)
+        insert_after = first_para._p
+        for line in body_lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            new_p = OxmlElement('w:p')
+            insert_after.addnext(new_p)
+            insert_after = new_p
+            pPr = OxmlElement('w:pPr')
+            if justify:
+                jc = OxmlElement('w:jc')
+                jc.set(_qn('w:val'), 'both')
+                pPr.append(jc)
+            if indent_twips:
+                ind = OxmlElement('w:ind')
+                ind.set(_qn('w:firstLine'), str(indent_twips))
+                pPr.append(ind)
+            new_p.append(pPr)
+            r_el = OxmlElement('w:r')
+            r_el.append(_make_rPr())
+            t_el = OxmlElement('w:t')
+            t_el.text = line_stripped
+            t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            r_el.append(t_el)
+            new_p.append(r_el)
+    else:
+        # 헤더 없음: 전체를 하나의 단락에
+        _write_lines_to_para(first_para, body_lines, apply_indent=True)
+
+
+def fill_response_table(doc, found_reasons: set, override_feasibility: dict = None):
+    """
+    대응방안 요약 표(표3)를 파싱된 거절이유로 채웁니다.
+    """
+    import copy
+    from docx.oxml import OxmlElement
+
+    tbl = doc.tables[3]
+
+    # 실제 적용할 거절이유 행 목록 계산
+    remaining = set(found_reasons)
+    rows_to_fill = []
+
+    for reason_set, label in REASON_GROUPS:
+        if reason_set <= remaining:
+            feasibility = DEFAULT_FEASIBILITY
+            if override_feasibility:
+                feasibility = override_feasibility.get(label, DEFAULT_FEASIBILITY)
+            rows_to_fill.append((label, feasibility))
+            remaining -= reason_set
+
+    for reason in sorted(remaining):
+        feasibility = DEFAULT_FEASIBILITY
+        if override_feasibility:
+            feasibility = override_feasibility.get(reason, DEFAULT_FEASIBILITY)
+        rows_to_fill.append((reason, feasibility))
+
+    if not rows_to_fill:
+        return
+
+    # 데이터 행(행1~) 삭제 전에 행1 XML을 템플릿으로 복사
+    template_tr = copy.deepcopy(tbl.rows[1]._tr)
+
+    for row in tbl.rows[1:]:
+        tbl._tbl.remove(row._tr)
+
+    # 거절이유별로 새 행 생성
+    for label, feasibility in rows_to_fill:
+        new_tr = copy.deepcopy(template_tr)
+        tbl._tbl.append(new_tr)
+
+        # 방금 추가된 마지막 행
+        new_row = tbl.rows[-1]
+
+        # 열0: 거절이유
+        c0 = _get_cell(new_row, 0)
+        if c0:
+            _set_response_cell(c0, label)
+
+        # 열1: 대응방안 요약 (빈칸)
+        c1 = _get_cell(new_row, 1)
+        if c1:
+            _set_response_cell(c1, "")
+
+        # 열2: 극복가능성
+        c2 = _get_cell(new_row, 2)
+        if c2:
+            _set_response_cell(c2, feasibility)
+
+
+# ── 3-b. OA 내용 분석 표 ─────────────────────
+
+# 표4 구조:
+#   행0: 헤더 (고정)
+#   행1: 현재 거절 이유 행1 (거절이유 첫 번째)
+#   행2: 현재 거절 이유 행2 (거절이유 두 번째, 없으면 비움)
+#   행3: 인용발명 행 (고정)
+#
+# 거절이유별 "거절 이유가 있는 부분" 컬럼 기본값 (빈칸으로 두어도 됨)
+OA_ANALYSIS_REASON_LABEL = {
+    "신규성":           "신규성",
+    "진보성":           "진보성",
+    "신규성/진보성":     "신규성/진보성",
+    "기재불비":         "기재불비",
+    "신규사항추가":      "신규사항추가",
+    "미완성 발명":       "미완성 발명",
+    "기타(비법정 발명)": "기타(비법정 발명)",
+}
+
+
+def fill_oa_analysis_table(doc, info: dict):
+    """
+    OA 내용 분석 표(표4)를 파싱된 거절이유로 채웁니다.
+    - col1: 거절이유가 있는 부분 (청구항)
+    - col2: 거절이유
+    - 거절이유 1개: 행1만 사용, 행2 삭제 + vMerge 해제
+    - 거절이유 2개: 행1, 행2 각각 기재
+    """
+    tbl = doc.tables[4]
+    found_reasons = info.get("거절이유_set", set())
+    claim_map     = info.get("거절이유_청구항", {})
+
+    # REASON_GROUPS 순서로 레이블 목록 생성
+    remaining = set(found_reasons)
+    reason_labels = []
+    for reason_set, label in REASON_GROUPS:
+        if reason_set <= remaining:
+            # 신규성/진보성 합친 경우: 두 청구항 텍스트 합치기
+            claims = [claim_map.get(r, "") for r in reason_set if claim_map.get(r)]
+            claim_map[label] = "\n".join(claims) if claims else ""
+            reason_labels.append(label)
+            remaining -= reason_set
+    for r in sorted(remaining):
+        reason_labels.append(r)
+
+    def get_unique_cells(row):
+        seen = set(); cells = []
+        for cell in row.cells:
+            cid = id(cell._tc)
+            if cid not in seen:
+                seen.add(cid); cells.append(cell)
+        return cells
+
+    from docx.oxml.ns import qn as _qn
+
+    row1 = tbl.rows[1]
+    row2 = tbl.rows[2]
+    cells1 = get_unique_cells(row1)
+    cells2 = get_unique_cells(row2)
+
+    if len(reason_labels) <= 1:
+        # ── 거절이유 1개: 행1만 사용, 행2 삭제
+        label = reason_labels[0] if reason_labels else ""
+        if len(cells1) > 1:
+            _set_response_cell(cells1[1], claim_map.get(label, ""))
+        if len(cells1) > 2:
+            _set_response_cell(cells1[2], label)
+
+        # 행1 col0 vMerge 해제 (단독 셀로)
+        tcPr0 = cells1[0]._tc.find(_qn('w:tcPr'))
+        if tcPr0 is not None:
+            vMerge = tcPr0.find(_qn('w:vMerge'))
+            if vMerge is not None:
+                tcPr0.remove(vMerge)
+
+        # 행2 삭제
+        tbl._tbl.remove(row2._tr)
+
+        # 기재불비만인 경우: 인용발명 행도 삭제 (신규성/진보성 없으면 인용발명 불필요)
+        needs_citation = found_reasons - {"기재불비", "신규사항추가", "미완성 발명", "기타(비법정 발명)"}
+        if not needs_citation:
+            # 행2 삭제 후 인용발명 행은 현재 행2(0-indexed)
+            if len(tbl.rows) > 2:
+                tbl._tbl.remove(tbl.rows[2]._tr)
+
+    else:
+        # ── 거절이유 2개: 행1, 행2 각각 채우기
+        for i, (row, cells) in enumerate([(row1, cells1), (row2, cells2)]):
+            label = reason_labels[i] if i < len(reason_labels) else ""
+            if len(cells) > 1:
+                _set_response_cell(cells[1], claim_map.get(label, ""))
+            if len(cells) > 2:
+                _set_response_cell(cells[2], label)
+
+
 # ── 3. DOCX 채우기 ───────────────────────────
 
-def fill_docx(template_path: str, info: dict, output_path: str):
+def _insert_claims_after_para(target_para, all_claims_text: str):
+    """
+    target_para 바로 뒤에 청구항을 삽입합니다.
+    구조:
+      - 【청구항 N】 헤더: 들여쓰기 없음, 양쪽맞춤 (단락 1개)
+      - 본문 각 줄: 모두 들여쓰기 1.41cm, 양쪽맞춤 (줄마다 별도 단락)
+    """
+    from docx.oxml.ns import qn as _qn
+
+    INDENT = 799  # 1.41cm in twips
+    insert_after = target_para._p
+
+    parts = re.split(r'(【청구항\s*\d+】)', all_claims_text)
+    blocks = []
+    for i in range(1, len(parts), 2):
+        header = parts[i].strip()
+        body   = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        blocks.append((header, body))
+
+    if not blocks:
+        blocks = [("", all_claims_text)]
+
+    def _make_para(line: str, apply_indent: bool) -> OxmlElement:
+        """단일 줄 → 단락 1개."""
+        new_p = OxmlElement('w:p')
+        pPr = OxmlElement('w:pPr')
+        jc = OxmlElement('w:jc')
+        jc.set(_qn('w:val'), 'both')
+        pPr.append(jc)
+        if apply_indent:
+            ind = OxmlElement('w:ind')
+            ind.set(_qn('w:firstLine'), str(INDENT))
+            pPr.append(ind)
+        new_p.append(pPr)
+        if line:
+            r_el = OxmlElement('w:r')
+            rPr = OxmlElement('w:rPr')
+            rFonts = OxmlElement('w:rFonts')
+            rFonts.set(_qn('w:ascii'), FONT_NAME)
+            rFonts.set(_qn('w:eastAsia'), FONT_NAME)
+            rPr.append(rFonts)
+            sz = OxmlElement('w:sz')
+            sz.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
+            szCs = OxmlElement('w:szCs')
+            szCs.set(_qn('w:val'), str(FONT_SIZE_PT * 2))
+            rPr.append(sz); rPr.append(szCs)
+            r_el.append(rPr)
+            t_el = OxmlElement('w:t')
+            t_el.text = line
+            t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            r_el.append(t_el)
+            new_p.append(r_el)
+        return new_p
+
+    for header, body in blocks:
+        # 헤더 단락: 들여쓰기 없음
+        if header:
+            p_header = _make_para(header, apply_indent=False)
+            insert_after.addnext(p_header)
+            insert_after = p_header
+        # 본문: 각 줄을 별도 단락으로, 모두 들여쓰기 적용
+        if body:
+            for line in body.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                p_line = _make_para(line, apply_indent=True)
+                insert_after.addnext(p_line)
+                insert_after = p_line
+
+
+def fill_current_claim_table(doc, claim1_with_header: str):
+    """
+    표5 '현재 청구항 (독립항 제 1항)' 아래 행(행1)에
+    【청구항 1】 헤더 포함 본문을 양쪽맞춤 + 들여쓰기(1.41cm)로 채웁니다.
+    """
+    if not claim1_with_header or len(doc.tables) < 6:
+        return
+    tbl = doc.tables[5]
+    if len(tbl.rows) < 2:
+        return
+    cell = tbl.rows[1].cells[0]
+    _set_response_cell(cell, claim1_with_header, justify=True, indent_twips=799)
+
+
+def fill_amendment_table(doc, claim1_with_header: str, all_claims_text: str):
+    """
+    표6 '보정안' 아래 행(행1)에 청구항 1만 양쪽맞춤 + 들여쓰기로 채웁니다.
+    '[첨부 1] 당소 보정안' 섹션: 기존 청구항 단락 삭제 후 새 전체 청구범위 삽입.
+    """
+    # 표6: 청구항 1만
+    if claim1_with_header and len(doc.tables) >= 7:
+        tbl = doc.tables[6]
+        if len(tbl.rows) >= 2:
+            cell = tbl.rows[1].cells[0]
+            _set_response_cell(cell, claim1_with_header, justify=True, indent_twips=799)
+
+    # [첨부 1] 당소 보정안: 청구범위 삽입
+    if not all_claims_text:
+        return
+
+    for i, para in enumerate(doc.paragraphs):
+        if para.text.strip() == "【특허청구범위】":
+            _insert_claims_after_para(para, all_claims_text)
+            break
+
+
+
+def fill_docx(template_path: str, info: dict, output_path: str,
+              app_pdf_path: str = ""):
     shutil.copy(template_path, output_path)
     doc = Document(output_path)
 
@@ -368,6 +924,18 @@ def fill_docx(template_path: str, info: dict, output_path: str):
             else:
                 set_cell_text(cell, fill_map.get(field_key, ""))
 
+    # ── 대응방안 요약 표 채우기 (표3, 0-indexed)
+    fill_response_table(doc, info.get("거절이유_set", set()), override_feasibility=None)
+
+    # ── OA 내용 분석 표 채우기 (표4, 0-indexed)
+    fill_oa_analysis_table(doc, info)
+
+    # ── 출원서 청구항 채우기 (표5, 표6, [첨부 1])
+    if app_pdf_path:
+        claim1_text, claim1_with_header, all_claims_text = parse_claims_from_application(app_pdf_path)
+        fill_current_claim_table(doc, claim1_with_header)
+        fill_amendment_table(doc, claim1_with_header, all_claims_text)
+
     doc.save(output_path)
 
 
@@ -375,37 +943,61 @@ def fill_docx(template_path: str, info: dict, output_path: str):
 
 def make_output_filename(info: dict) -> str:
     """OA 종류와 관리번호로 출력 파일명 자동 생성."""
-    mgmt_no = info.get("당소관리번호", "")
+    mgmt_no = info.get("당소관리번호", "").upper()
     oa_type = info.get("OA 종류", "")
 
     if oa_type == "거절결정":
-        suffix = "거절결정검토보고서"
+        suffix = "거절결정 검토보고서"
     else:
-        suffix = "1차OA검토보고서"
+        suffix = "1차OA 검토보고서"
 
-    return f"[파이특허][{mgmt_no}]{suffix}.docx"
+    return f"[파이특허][{mgmt_no}] {suffix}.docx"
 
 
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    if len(args) < 2:
         print(__doc__)
         sys.exit(1)
 
-    pdf_path      = sys.argv[1]
-    template_path = sys.argv[2]
+    # 인수 파싱:
+    #   args[0]  = 의견제출통지서 PDF (필수)
+    #   args[1]  = 출원서 RTF 또는 DOCX (선택) — .rtf면 무조건 출원서,
+    #              .docx이고 args[2]도 있으면 출원서
+    #   args[-1] = 템플릿 DOCX (필수)
+    #
+    # 출력 파일명은 항상 자동 생성 ([파이특허][관리번호] 1차OA 검토보고서.docx)
 
-    print(f"[1/3] PDF 파싱: {pdf_path}")
+    pdf_path = args[0]  # 의견제출통지서
+
+    app_pdf_path = ""
+    if len(args) >= 2 and args[1].lower().endswith(".rtf"):
+        app_pdf_path  = args[1]
+        template_path = args[2] if len(args) >= 3 else None
+    elif len(args) >= 3 and args[1].lower().endswith(".docx"):
+        app_pdf_path  = args[1]
+        template_path = args[2]
+    else:
+        template_path = args[1] if len(args) >= 2 else None
+
+    if not template_path:
+        print("❌ 템플릿 DOCX 경로를 지정해주세요.")
+        print(__doc__)
+        sys.exit(1)
+
+    print(f"[1/3] 파싱: {pdf_path}")
     info = parse_oa_pdf(pdf_path, template_path)
     print("      결과:")
     for k, v in info.items():
         print(f"        {'거절이유 항목' if k == '거절이유_set' else k}: {v}")
 
-    # 출력 파일명: 인수로 지정하면 그걸 쓰고, 없으면 자동 생성
-    output_path = sys.argv[3] if len(sys.argv) >= 4 else make_output_filename(info)
+    output_path = make_output_filename(info)
 
     print(f"\n[2/3] 템플릿: {template_path}")
+    if app_pdf_path:
+        print(f"      출원서: {app_pdf_path}")
     print(f"[3/3] 저장:   {output_path}")
-    fill_docx(template_path, info, output_path)
+    fill_docx(template_path, info, output_path, app_pdf_path=app_pdf_path)
     print(f"\n✓ 완료: {output_path}")
 
 
