@@ -12,6 +12,7 @@ import streamlit as st
 from fill_oa_report import (
     parse_oa_pdf, fill_docx, make_output_filename,
     FEASIBILITY_OPTIONS, REASON_GROUPS, DEFAULT_FEASIBILITY_LABEL,
+    REASON_TO_LAW,
 )
 
 # ── 템플릿 경로 설정 ──────────────────────────
@@ -95,9 +96,39 @@ if oa_pdf_file:
         target_col = col_a if i % 2 == 0 else col_b
         target_col.markdown(f"**{label}**  \n{val}")
 
-    # 거절이유
-    reasons = info.get("거절이유_set", set())
-    st.markdown(f"**거절이유**: {', '.join(sorted(reasons)) if reasons else '–'}")
+    # 거절이유 + 청구항 + 법조항
+    reasons   = info.get("거절이유_set", set())
+    claim_map = info.get("거절이유_청구항", {})
+
+    st.markdown("**거절이유 / 청구항 / 관련 법조항**")
+    if reasons:
+        # REASON_GROUPS 순서로 정렬 후 표시
+        from fill_oa_report import REASON_GROUPS as _RG
+        remaining = set(reasons)
+        ordered = []
+        for reason_set, label in _RG:
+            if reason_set <= remaining:
+                ordered.append(label)
+                remaining -= reason_set
+        for r in sorted(remaining):
+            ordered.append(r)
+
+        rows = []
+        for label in ordered:
+            law   = REASON_TO_LAW.get(label, "–")
+            # 단일 거절이유인 경우 원래 키로 청구항 조회
+            claims = claim_map.get(label, "")
+            if not claims:
+                # 신규성/진보성 합쳐진 경우 개별 키로 시도
+                parts = [claim_map.get(r, "") for r in (label.split("/") if "/" in label else [label]) if claim_map.get(r)]
+                claims = " / ".join(parts)
+            rows.append((label, claims or "–", law))
+
+        import pandas as pd
+        df = pd.DataFrame(rows, columns=["거절이유", "해당 청구항", "관련 법조항"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.markdown("–")
 
     st.divider()
 
