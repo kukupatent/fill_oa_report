@@ -152,11 +152,14 @@ if oa_pdf_file:
         cols = st.columns(len(reason_labels))
         for col, label in zip(cols, reason_labels):
             with col:
+                key = f"feasibility_{label}"
+                # session_state에 없으면 기본값으로 초기화
+                if key not in st.session_state:
+                    st.session_state[key] = DEFAULT_FEASIBILITY_LABEL
                 selected = col.selectbox(
                     label,
                     options=f_options,
-                    index=f_options.index(DEFAULT_FEASIBILITY_LABEL),
-                    key=f"feasibility_{label}",
+                    key=key,
                 )
                 override_feasibility[label] = selected
                 # 선택된 배경색으로 색상 표시
