@@ -98,7 +98,7 @@ def parse_rejection_from_table(pdf_path: str) -> tuple:
                     if not any("법조항" in h for h in header):
                         continue
                     law_col   = next(i for i, h in enumerate(header) if "법조항" in h)
-                    claim_col = next((i for i, h in enumerate(header) if "있는 부분" in h), None)
+                    claim_col = next((i for i, h in enumerate(header) if "있는 부분" in h or "않은 부분" in h), None)
                     for row in tbl[1:]:
                         law_text   = str(row[law_col] or "")
                         claim_text = str(row[claim_col] or "").strip() if claim_col is not None else ""
@@ -142,12 +142,14 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
     names = re.findall(r"발\s*명\s*자\s*성\s*명\s+(\S+)", full_text)
     info["발명자"] = ", ".join(names)
 
-    # 발명의 명칭
-    # 1순위: 같은 줄에서만 캡처 (거절결정서·의견제출통지서 등 한 줄 레이아웃)
-    raw = find(r"발\s*명\s*의\s*명\s*칭\s+(.+?)(?:\n|$)")
-    # 2순위: DOTALL로 여러 줄 캡처 (명칭이 여러 줄에 걸치는 경우), 단 과다 캡처 방지를 위해 종결자 명시
-    if not raw:
-        raw = find(r"발\s*명\s*의\s*명\s*칭\s+(.+?)(?:\n발송번호|\n출원번호|\n1\.|$)", re.DOTALL)
+
+    # 발명의 명칭 (한 줄 또는 두 줄 걸침 모두 처리)
+    # 종결자: 발송번호, 출원번호, 숫자로 시작하는 본문("1. 이 출원..."), 날짜 줄(YYYY.MM)
+    raw = find(
+        r"발\s*명\s*의\s*명\s*칭\s+(.+?)"
+        r"(?=\n발송번호|\n출\s*원\s*번\s*호|\n\d+\.|\n\d{4}\.\d{2}|\Z)",
+        re.DOTALL
+    )
     info["발명의 명칭"] = " ".join(raw.split())
 
     # 통지서 발행일 (발송일자)
@@ -202,6 +204,25 @@ def parse_oa_pdf(pdf_path: str, template_path: str = "") -> dict:
         for pattern, reason in LAW_TO_REASON.items():
             if re.search(pattern, full_text):
                 info["거절이유_set"].add(reason)
+
+    # ── 인용발명 파싱: "인용발명 N : ..." 형태 전체 추출
+    # 페이지 번호(예: "1/5") 등 불필요한 아티팩트 제거 후 저장
+    raw_refs = re.findall(
+        r'(?:기\s*통지된\s*)?인용발명\s*(\d+)\s*:\s*(.+?)'
+        r'(?=\n(?:기\s*통지된\s*)?인용발명\s*\d+\s*:'   # 다음 인용발명
+        r'|\n[가나다라마]\.\s'                              # 가. 나. 다. 등 소절
+        r'|\n\d+\)\s'                                     # 1) 목적 및 효과의 대비 등
+        r'|\n\[첨\s*부\]'                                  # [첨부]
+        r'|\Z)',
+        full_text, re.DOTALL
+    )
+    citations = []
+    for num, desc in raw_refs:
+        # 줄바꿈 사이 또는 줄 끝에 단독으로 있는 페이지 번호(예: \n1/5) 제거
+        clean = re.sub(r'\n\d+/\d+', '', desc)
+        clean = " ".join(clean.split())
+        citations.append(f"인용발명 {num} : {clean}")
+    info["인용발명"] = citations   # ["인용발명 1 : ...", "인용발명 2 : ...", ...]
 
     return info
 
@@ -764,6 +785,19 @@ def fill_oa_analysis_table(doc, info: dict):
                 _set_response_cell(cells[1], claim_map.get(label, ""))
             if len(cells) > 2:
                 _set_response_cell(cells[2], label)
+
+    # ── 인용발명 행 채우기 (행3, 행2 삭제 후엔 행2)
+    citations = info.get("인용발명", [])
+    if citations:
+        # 현재 행 수 기준으로 마지막 행 = 인용발명 행
+        citation_row_idx = len(tbl.rows) - 1
+        if citation_row_idx >= 1:
+            citation_row   = tbl.rows[citation_row_idx]
+            citation_cells = get_unique_cells(citation_row)
+            # 인용발명 셀은 헤더 제외 첫 번째 값 셀 (병합되어 있을 수 있음)
+            # 셀이 2개 이상이면 [1], 1개면 [0]
+            target_cell = citation_cells[1] if len(citation_cells) > 1 else citation_cells[0]
+            _set_response_cell(target_cell, "\n".join(citations))
 
 
 # ── 3. DOCX 채우기 ───────────────────────────
